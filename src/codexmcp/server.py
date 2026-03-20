@@ -202,7 +202,7 @@ class StreamProcessor:
         """Return a consistent cross-field snapshot for readers."""
         with self._lock:
             return {
-                "success": bool(self.agent_messages) and self.thread_id is not None,
+                "success": self.done and bool(self.agent_messages) and self.thread_id is not None,
                 "agent_messages": self.agent_messages,
                 "thread_id": self.thread_id,
                 "all_messages": list(self.all_messages),
@@ -219,7 +219,7 @@ class StreamProcessor:
     @property
     def success(self) -> bool:
         with self._lock:
-            return bool(self.agent_messages) and self.thread_id is not None
+            return self.done and bool(self.agent_messages) and self.thread_id is not None
 
     def to_result(self) -> Dict[str, Any]:
         return self.snapshot()
@@ -279,8 +279,22 @@ def _prune_registry_locked(now: Optional[float] = None) -> None:
 # ---------------------------------------------------------------------------
 # Subprocess runner with timeout
 # ---------------------------------------------------------------------------
+_busy_check_available: Optional[bool] = None  # cached probe result
+
+
 def _is_process_busy(pid: int) -> bool:
-    """Check if a process or any of its descendants is consuming CPU."""
+    """Check if a process or any of its descendants is consuming CPU.
+
+    Returns False (fail-closed) when pgrep/ps are unavailable so that the
+    idle timeout still fires.  The first call probes availability and caches
+    the result to avoid repeated subprocess spawns on unsupported platforms.
+    """
+    global _busy_check_available
+
+    # Fast path: if we already know the tools aren't available, don't bother
+    if _busy_check_available is False:
+        return False
+
     try:
         pgid = os.getpgid(pid)
         pgrep = subprocess.run(
@@ -289,6 +303,7 @@ def _is_process_busy(pid: int) -> bool:
         )
         pids = pgrep.stdout.strip()
         if not pids:
+            _busy_check_available = True
             return False
         pid_list = ",".join(pids.split())
         ps_result = subprocess.run(
@@ -300,9 +315,17 @@ def _is_process_busy(pid: int) -> bool:
             for line in ps_result.stdout.strip().splitlines()
             if line.strip()
         )
+        _busy_check_available = True
         return total_cpu > 0.5
+    except (OSError, AttributeError):
+        # OSError / AttributeError → pgrep/ps/getpgid not available (Windows etc.)
+        # Fail-closed: let the idle timeout fire normally
+        _busy_check_available = False
+        log.info("CPU busy-check unavailable on this platform, idle timeout will fire normally")
+        return False
     except Exception:
-        return True
+        # Transient error (timeout, parse failure) — fail-closed to be safe
+        return False
 
 
 def run_shell_command(
