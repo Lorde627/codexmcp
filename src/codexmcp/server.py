@@ -2,44 +2,94 @@
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import json
+import logging
 import os
 import queue
+import re
+import signal
 import subprocess
+import sys
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Annotated, Any, Dict, Generator, List, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
-from pydantic import BeforeValidator, Field
+from pydantic import Field
 import shutil
+
+# ---------------------------------------------------------------------------
+# Logging — writes to stderr so it never contaminates MCP stdio transport
+# ---------------------------------------------------------------------------
+log = logging.getLogger("codexmcp")
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter("[codexmcp %(levelname)s] %(message)s"))
+log.addHandler(_handler)
+log.setLevel(logging.INFO)
 
 mcp = FastMCP("Codex MCP Server-from guda.studio")
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+GLOBAL_TIMEOUT = 600       # 10 min hard cap per invocation
+IDLE_TIMEOUT = 120         # 2 min with zero output → assume hung
+MAX_RETRIES = 2            # retry up to 2 times on transient failure
+RETRY_DELAY = 3            # seconds between retries
+GRACEFUL_SHUTDOWN_DELAY = 0.3
 
-def _empty_str_to_none(value: str | None) -> str | None:
-    """Convert empty strings to None for optional UUID parameters."""
-    if isinstance(value, str) and not value.strip():
-        return None
-    return value
+# Track child processes for cleanup on server exit
+_child_processes: list[subprocess.Popen] = []
+_child_lock = threading.Lock()
 
 
-def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
+def _cleanup_children() -> None:
+    """Kill any lingering codex child processes on server exit."""
+    with _child_lock:
+        for proc in _child_processes:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            except OSError:
+                pass
+        _child_processes.clear()
+
+
+atexit.register(_cleanup_children)
+
+
+# ---------------------------------------------------------------------------
+# Subprocess runner with timeout
+# ---------------------------------------------------------------------------
+def run_shell_command(
+    cmd: list[str],
+    global_timeout: float = GLOBAL_TIMEOUT,
+    idle_timeout: float = IDLE_TIMEOUT,
+) -> Generator[str, None, None]:
     """Execute a command and stream its output line-by-line.
 
     Args:
-        cmd: Command and arguments as a list (e.g., ["codex", "exec", "prompt"])
+        cmd: Command and arguments as a list.
+        global_timeout: Maximum total seconds before force-killing.
+        idle_timeout: Maximum seconds without output before force-killing.
 
     Yields:
-        Output lines from the command
+        Output lines (stripped) from the command.
     """
-    # On Windows, codex is exposed via a *.cmd shim. Use cmd.exe with /s so
-    # user prompts containing quotes/newlines aren't reinterpreted as shell syntax.
     popen_cmd = cmd.copy()
-    codex_path = shutil.which('codex') or cmd[0]
+    codex_path = shutil.which("codex") or cmd[0]
     popen_cmd[0] = codex_path
+
+    # Use start_new_session on Unix so child gets its own process group,
+    # allowing us to kill it and all its descendants cleanly.
+    use_new_session = os.name != "nt"
 
     process = subprocess.Popen(
         popen_cmd,
@@ -48,14 +98,19 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
-        encoding='utf-8',
+        encoding="utf-8",
+        start_new_session=use_new_session,
     )
 
+    with _child_lock:
+        _child_processes.append(process)
+
+    log.info("codex process started (pid=%d)", process.pid)
+
     output_queue: queue.Queue[str | None] = queue.Queue()
-    GRACEFUL_SHUTDOWN_DELAY = 0.3
+    abort_event = threading.Event()
 
     def is_turn_completed(line: str) -> bool:
-        """Check if the line indicates turn completion via JSON parsing."""
         try:
             data = json.loads(line)
             return data.get("type") == "turn.completed"
@@ -63,39 +118,73 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
             return False
 
     def read_output() -> None:
-        """Read process output in a separate thread."""
-        if process.stdout:
-            for line in iter(process.stdout.readline, ""):
-                stripped = line.strip()
-                output_queue.put(stripped)
-                if is_turn_completed(stripped):
-                    time.sleep(GRACEFUL_SHUTDOWN_DELAY)
-                    process.terminate()
-                    break
-            process.stdout.close()
-        output_queue.put(None)
+        try:
+            if process.stdout:
+                for line in iter(process.stdout.readline, ""):
+                    if abort_event.is_set():
+                        break
+                    stripped = line.strip()
+                    if stripped:
+                        output_queue.put(stripped)
+                    if is_turn_completed(stripped):
+                        time.sleep(GRACEFUL_SHUTDOWN_DELAY)
+                        _terminate_process(process, use_new_session)
+                        break
+                process.stdout.close()
+        except Exception as exc:
+            log.warning("read_output thread error: %s", exc)
+        finally:
+            output_queue.put(None)
 
-    thread = threading.Thread(target=read_output)
+    thread = threading.Thread(target=read_output, daemon=True)
     thread.start()
 
-    # Yield lines while process is running
+    start_time = time.monotonic()
+    last_output_time = start_time
+    timed_out = False
+
     while True:
+        elapsed = time.monotonic() - start_time
+        idle_elapsed = time.monotonic() - last_output_time
+        if elapsed > global_timeout or idle_elapsed > idle_timeout:
+            timed_out = True
+            break
         try:
             line = output_queue.get(timeout=0.5)
             if line is None:
                 break
+            last_output_time = time.monotonic()
             yield line
         except queue.Empty:
             if process.poll() is not None and not thread.is_alive():
                 break
 
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+    # --- cleanup ---
+    if timed_out:
+        abort_event.set()
+        timeout_kind = "global" if (time.monotonic() - start_time) > global_timeout else "idle"
+        log.warning(
+            "codex process timed out (%s, pid=%d), killing",
+            timeout_kind,
+            process.pid,
+        )
+        _kill_process(process, use_new_session)
+        yield json.dumps({
+            "type": "error",
+            "message": (
+                f"codex process killed: {timeout_kind} timeout "
+                f"({global_timeout}s global / {idle_timeout}s idle) exceeded"
+            ),
+        })
+    else:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill_process(process, use_new_session)
+
     thread.join(timeout=5)
 
+    # drain remaining
     while not output_queue.empty():
         try:
             line = output_queue.get_nowait()
@@ -104,29 +193,134 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
         except queue.Empty:
             break
 
-def windows_escape(prompt):
-    """
-    Windows 风格的字符串转义函数。
-    把常见特殊字符转义成 \\ 形式，适合命令行、JSON 或路径使用。
-    比如：\n 变成 \\n，" 变成 \\"。
-    """
-    # 先处理反斜杠，避免它干扰其他替换
-    result = prompt.replace('\\', '\\\\')
-    # 双引号，转义成 \"，防止字符串边界乱套
+    # surface non-zero exit code
+    rc = process.returncode
+    if rc and rc != 0:
+        log.warning("codex process exited with code %d", rc)
+        yield json.dumps({
+            "type": "error",
+            "message": f"codex process exited with code {rc}",
+        })
+
+    with _child_lock:
+        try:
+            _child_processes.remove(process)
+        except ValueError:
+            pass
+
+    elapsed_total = time.monotonic() - start_time
+    log.info("codex process finished (pid=%d, %.1fs)", process.pid, elapsed_total)
+
+
+def _terminate_process(proc: subprocess.Popen, use_pg: bool) -> None:
+    """Send SIGTERM, preferring the process group on Unix."""
+    try:
+        if use_pg:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _kill_process(proc: subprocess.Popen, use_pg: bool) -> None:
+    """Escalate: SIGTERM → wait → SIGKILL."""
+    _terminate_process(proc, use_pg)
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            if use_pg:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                proc.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def windows_escape(prompt: str) -> str:
+    result = prompt.replace("\\", "\\\\")
     result = result.replace('"', '\\"')
-    # 换行符，Windows 常用 \r\n，但我们分开转义
-    result = result.replace('\n', '\\n')
-    result = result.replace('\r', '\\r')
-    # 制表符，空格的“超级版”
-    result = result.replace('\t', '\\t')
-    # 其他常见：退格符（像按了后退键）、换页符（打印机跳页用）
-    result = result.replace('\b', '\\b')
-    result = result.replace('\f', '\\f')
-    # 如果有单引号，也转义下（不过 Windows 命令行不那么严格，但保险起见）
+    result = result.replace("\n", "\\n")
+    result = result.replace("\r", "\\r")
+    result = result.replace("\t", "\\t")
+    result = result.replace("\b", "\\b")
+    result = result.replace("\f", "\\f")
     result = result.replace("'", "\\'")
-    
     return result
 
+
+# ---------------------------------------------------------------------------
+# Core parsing logic (extracted for retry) — runs in a thread, NOT on the
+# asyncio event loop
+# ---------------------------------------------------------------------------
+def _parse_codex_output(cmd: list[str]) -> Dict[str, Any]:
+    """Run a codex command and parse the JSONL output into a result dict."""
+    all_messages: list[Dict[str, Any]] = []
+    raw_lines: list[str] = []
+    agent_messages = ""
+    errors: list[str] = []
+    thread_id: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
+
+    for line in run_shell_command(cmd):
+        raw_lines.append(line)
+        try:
+            line_dict = json.loads(line.strip())
+            all_messages.append(line_dict)
+
+            line_type = line_dict.get("type", "")
+
+            # extract thread_id
+            if line_dict.get("thread_id") is not None:
+                thread_id = line_dict["thread_id"]
+
+            # extract agent text
+            item = line_dict.get("item", {})
+            if item.get("type") == "agent_message":
+                agent_messages += item.get("text", "")
+
+            # extract token usage from turn.completed
+            if line_type == "turn.completed":
+                turn_usage = line_dict.get("usage")
+                if turn_usage:
+                    usage = turn_usage
+
+            # capture errors
+            if "fail" in line_type:
+                err_detail = line_dict.get("error", {}).get("message", "unknown failure")
+                errors.append(f"[codex fail] {err_detail}")
+            elif "error" in line_type:
+                error_msg = line_dict.get("message", "")
+                is_reconnecting = bool(
+                    re.match(r"^Reconnecting\.\.\.\s+\d+/\d+", error_msg)
+                )
+                if not is_reconnecting:
+                    errors.append(f"[codex error] {error_msg}")
+
+        except json.JSONDecodeError:
+            errors.append(f"[non-JSON output] {line}")
+        except Exception as exc:
+            errors.append(f"[unexpected error] {exc!r} — line: {line!r}")
+
+    return {
+        "success": bool(agent_messages) and thread_id is not None,
+        "agent_messages": agent_messages,
+        "thread_id": thread_id,
+        "all_messages": all_messages,
+        "errors": errors,
+        "raw_lines": raw_lines,
+        "usage": usage,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MCP tool
+# ---------------------------------------------------------------------------
 @mcp.tool(
     name="codex",
     description="""
@@ -192,93 +386,103 @@ async def codex(
     ] = "",
 ) -> Dict[str, Any]:
     """Execute a Codex CLI session and return the results."""
-    # Build command as list to avoid injection
-    cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
-    
-    if len(image):
-        cmd.extend(["--image", ",".join(image)])
-        
+
+    # --- pre-flight validation ---
+    cd_path = Path(cd)
+    if not cd_path.exists():
+        return {
+            "success": False,
+            "error": f"Working directory does not exist: {cd_path}",
+        }
+
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        return {
+            "success": False,
+            "error": "codex CLI not found in PATH. Install it first.",
+        }
+
+    # --- build command ---
+    cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd_path), "--json"]
+
+    if image:
+        cmd.extend(["--image", ",".join(str(p) for p in image)])
     if model:
         cmd.extend(["--model", model])
-        
     if profile:
         cmd.extend(["--profile", profile])
-        
     if yolo:
         cmd.append("--yolo")
-    
     if skip_git_repo_check:
         cmd.append("--skip-git-repo-check")
-
     if SESSION_ID:
         cmd.extend(["resume", str(SESSION_ID)])
-        
-    if os.name == "nt":
-        PROMPT = windows_escape(PROMPT)
-    else:
-        PROMPT = PROMPT
-    cmd += ['--', PROMPT]
 
-    all_messages: list[Dict[str, Any]] = []
-    agent_messages = ""
-    success = True
-    err_message = ""
-    thread_id: Optional[str] = None
+    prompt_text = windows_escape(PROMPT) if os.name == "nt" else PROMPT
+    cmd += ["--", prompt_text]
 
-    for line in run_shell_command(cmd):
-        try:
-            line_dict = json.loads(line.strip())
-            all_messages.append(line_dict)
-            item = line_dict.get("item", {})
-            item_type = item.get("type", "")
-            if item_type == "agent_message":
-                agent_messages = agent_messages + item.get("text", "")
-            if line_dict.get("thread_id") is not None:
-                thread_id = line_dict.get("thread_id")
-            if "fail" in line_dict.get("type", ""):
-                success = False if len(agent_messages) == 0 else success
-                err_message += "\n\n[codex error] " + line_dict.get("error", {}).get("message", "")
-            if "error" in line_dict.get("type", ""):
-                error_msg = line_dict.get("message", "")
-                import re
-                is_reconnecting = bool(re.match(r'^Reconnecting\.\.\.\s+\d+/\d+', error_msg))
-                
-                if not is_reconnecting:
-                    success = False if len(agent_messages) == 0 else success
-                    err_message += "\n\n[codex error] " + error_msg
-                    
-        except json.JSONDecodeError:
-            # import sys
-            # print(f"Ignored non-JSON line: {line}", file=sys.stderr)
-            err_message += "\n\n[json decode error] " + line
-            continue
-            
-        except Exception as error:
-            err_message += "\n\n[unexpected error] " + f"Unexpected error: {error}. Line: {line!r}"
-            success = False
+    # --- execute with retry ---
+    # CRITICAL: use asyncio.to_thread() so the blocking subprocess work
+    # runs in a thread pool instead of freezing the MCP event loop.
+    last_parsed: Optional[Dict[str, Any]] = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        log.info("codex attempt %d/%d", attempt, MAX_RETRIES)
+        parsed = await asyncio.to_thread(_parse_codex_output, cmd)
+        last_parsed = parsed
+
+        if parsed["success"]:
             break
 
-    if thread_id is None:
-        success = False
-        err_message = "Failed to get `SESSION_ID` from the codex session. \n\n" + err_message
-        
-    if len(agent_messages) == 0:
-        success = False
-        err_message = "Failed to get `agent_messages` from the codex session. \n\n You can try to set `return_all_messages` to `True` to get the full reasoning information. " + err_message
+        # don't retry if we already got partial agent content
+        if parsed["agent_messages"]:
+            break
 
-    if success:
+        if attempt < MAX_RETRIES:
+            log.info(
+                "codex attempt %d failed (%s), retrying in %ds",
+                attempt,
+                "; ".join(parsed["errors"][:3]) or "no output",
+                RETRY_DELAY,
+            )
+            await asyncio.sleep(RETRY_DELAY)
+
+    parsed = last_parsed  # type: ignore[assignment]
+
+    # --- build response ---
+    if parsed["success"]:
         result: Dict[str, Any] = {
             "success": True,
-            "SESSION_ID": thread_id,
-            "agent_messages": agent_messages,
-            # "PROMPT": PROMPT,
+            "SESSION_ID": parsed["thread_id"],
+            "agent_messages": parsed["agent_messages"],
         }
-        
+        if parsed["usage"]:
+            result["usage"] = parsed["usage"]
+        if parsed["errors"]:
+            result["warnings"] = parsed["errors"]
     else:
-        result = {"success": False, "error": err_message}
-        
+        error_parts: list[str] = []
+        if not parsed["thread_id"]:
+            error_parts.append("Failed to obtain SESSION_ID from codex.")
+        if not parsed["agent_messages"]:
+            error_parts.append("No agent_messages received from codex.")
+        if parsed["errors"]:
+            error_parts.append("Errors encountered:")
+            error_parts.extend(f"  - {e}" for e in parsed["errors"])
+
+        result = {
+            "success": False,
+            "error": "\n".join(error_parts),
+            "all_messages": parsed["all_messages"],
+            "raw_lines": parsed["raw_lines"][-20:],
+        }
+        if parsed["agent_messages"]:
+            result["agent_messages"] = parsed["agent_messages"]
+        if parsed["thread_id"]:
+            result["SESSION_ID"] = parsed["thread_id"]
+
     if return_all_messages:
-            result["all_messages"] = all_messages
+        result["all_messages"] = parsed["all_messages"]
 
     return result
 
