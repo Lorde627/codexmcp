@@ -535,7 +535,6 @@ def _build_codex_cmd(
         "--sandbox", sandbox,
         "--cd", str(cd_path),
         "--json",
-        "--ephemeral",
     ]
 
     images = list(image) if image else []
@@ -611,6 +610,15 @@ def _build_response(parsed: Dict[str, Any], return_all: bool) -> Dict[str, Any]:
         result["all_messages"] = parsed["all_messages"]
 
     return result
+
+
+def _should_retry(parsed: Dict[str, Any], *, is_resume: bool) -> bool:
+    """Return True when a failed run looks transient enough to retry."""
+    if parsed["success"] or parsed["agent_messages"] or is_resume:
+        return False
+    if parsed["errors"] and all("[non-JSON output]" in e for e in parsed["errors"]):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -690,13 +698,7 @@ async def codex(
         parsed = await asyncio.to_thread(_parse_codex_output, cmd, PROMPT)
         last_parsed = parsed
 
-        if parsed["success"]:
-            break
-        if parsed["agent_messages"]:
-            break
-        if is_resume:
-            break
-        if parsed["errors"] and all("[non-JSON output]" in e for e in parsed["errors"]):
+        if not _should_retry(parsed, is_resume=is_resume):
             break
 
         if attempt < MAX_RETRIES:
@@ -758,6 +760,15 @@ async def codex_dispatch(
 
     with _registry_lock:
         _prune_registry_locked()
+        if len(_task_registry) >= MAX_TRACKED_TASKS:
+            running = sum(1 for t in _task_registry.values() if t.completed_at is None)
+            return {
+                "success": False,
+                "error": (
+                    f"Task registry full ({len(_task_registry)}/{MAX_TRACKED_TASKS}); "
+                    f"{running} active task(s) still running. Cancel or wait for tasks to complete."
+                ),
+            }
         task_id = _allocate_task_id_locked()
         state = _TaskState(
             task_id=task_id,
@@ -767,12 +778,28 @@ async def codex_dispatch(
         _task_registry[task_id] = state
 
     async def _run() -> None:
+        is_resume = bool(SESSION_ID)
         try:
-            await asyncio.to_thread(
-                _parse_codex_output, cmd, PROMPT,
-                stream=state.stream,
-                cancel_event=state.cancel_event,
-            )
+            for attempt in range(1, MAX_RETRIES + 1):
+                await asyncio.to_thread(
+                    _parse_codex_output, cmd, PROMPT,
+                    stream=state.stream,
+                    cancel_event=state.cancel_event,
+                )
+                parsed = state.stream.to_result()
+                if not _should_retry(parsed, is_resume=is_resume):
+                    break
+                if state.cancel_event.is_set():
+                    break
+                if attempt < MAX_RETRIES:
+                    log.info(
+                        "dispatch task %s attempt %d failed, retrying in %ds",
+                        task_id, attempt, RETRY_DELAY,
+                    )
+                    await asyncio.sleep(RETRY_DELAY)
+                    # Reset stream for next attempt
+                    state.stream = StreamProcessor()
+
             with _registry_lock:
                 if state.status == "running":
                     state.status = "completed" if state.stream.success else "failed"
