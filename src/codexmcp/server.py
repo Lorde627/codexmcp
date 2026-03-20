@@ -36,7 +36,8 @@ mcp = FastMCP("Codex MCP Server-from guda.studio")
 # Constants
 # ---------------------------------------------------------------------------
 GLOBAL_TIMEOUT = 600       # 10 min hard cap per invocation
-IDLE_TIMEOUT = 120         # 2 min with zero output → assume hung
+IDLE_TIMEOUT_INITIAL = 120 # 2 min before first output → fast startup-failure detection
+IDLE_TIMEOUT_ACTIVE = 480  # 8 min after first output → allow deep reasoning
 MAX_RETRIES = 2            # retry up to 2 times on transient failure
 RETRY_DELAY = 3            # seconds between retries
 GRACEFUL_SHUTDOWN_DELAY = 0.3
@@ -68,17 +69,37 @@ atexit.register(_cleanup_children)
 # ---------------------------------------------------------------------------
 # Subprocess runner with timeout
 # ---------------------------------------------------------------------------
+def _is_process_busy(pid: int) -> bool:
+    """Check if a process is still consuming CPU (not just sleeping/hung).
+
+    Uses /proc or ps to detect whether the child is actively working.
+    Returns True if we can't determine status (fail-open).
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "%cpu=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=3,
+        )
+        cpu = float(result.stdout.strip())
+        return cpu > 0.1
+    except Exception:
+        return True  # fail-open: assume busy if we can't check
+
+
 def run_shell_command(
     cmd: list[str],
     global_timeout: float = GLOBAL_TIMEOUT,
-    idle_timeout: float = IDLE_TIMEOUT,
 ) -> Generator[str, None, None]:
     """Execute a command and stream its output line-by-line.
+
+    Uses adaptive idle timeout: short before first output (fast failure
+    detection), long after first output (allow deep model reasoning).
+    When idle timeout is about to fire, checks process CPU to distinguish
+    'still thinking' from 'truly hung'.
 
     Args:
         cmd: Command and arguments as a list.
         global_timeout: Maximum total seconds before force-killing.
-        idle_timeout: Maximum seconds without output before force-killing.
 
     Yields:
         Output lines (stripped) from the command.
@@ -141,19 +162,38 @@ def run_shell_command(
 
     start_time = time.monotonic()
     last_output_time = start_time
+    got_first_output = False
     timed_out = False
 
     while True:
         elapsed = time.monotonic() - start_time
         idle_elapsed = time.monotonic() - last_output_time
-        if elapsed > global_timeout or idle_elapsed > idle_timeout:
+        idle_limit = IDLE_TIMEOUT_ACTIVE if got_first_output else IDLE_TIMEOUT_INITIAL
+
+        if elapsed > global_timeout:
             timed_out = True
             break
+
+        if idle_elapsed > idle_limit:
+            # Before killing, check if process is still actively working
+            if process.poll() is None and _is_process_busy(process.pid):
+                log.info(
+                    "idle timeout (%.0fs) reached but process pid=%d still busy, extending",
+                    idle_elapsed, process.pid,
+                )
+                # Reset idle timer — process is still working
+                last_output_time = time.monotonic()
+                continue
+            timed_out = True
+            break
+
         try:
             line = output_queue.get(timeout=0.5)
             if line is None:
                 break
             last_output_time = time.monotonic()
+            if not got_first_output:
+                got_first_output = True
             yield line
         except queue.Empty:
             if process.poll() is not None and not thread.is_alive():
@@ -162,18 +202,17 @@ def run_shell_command(
     # --- cleanup ---
     if timed_out:
         abort_event.set()
-        timeout_kind = "global" if (time.monotonic() - start_time) > global_timeout else "idle"
+        timeout_kind = "global" if elapsed > global_timeout else "idle"
         log.warning(
-            "codex process timed out (%s, pid=%d), killing",
-            timeout_kind,
-            process.pid,
+            "codex process timed out (%s, pid=%d, elapsed=%.0fs, idle=%.0fs), killing",
+            timeout_kind, process.pid, elapsed, idle_elapsed,
         )
         _kill_process(process, use_new_session)
         yield json.dumps({
             "type": "error",
             "message": (
                 f"codex process killed: {timeout_kind} timeout "
-                f"({global_timeout}s global / {idle_timeout}s idle) exceeded"
+                f"({global_timeout}s global / {idle_limit}s idle) exceeded"
             ),
         })
     else:
