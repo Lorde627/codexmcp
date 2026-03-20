@@ -105,6 +105,7 @@ def _is_process_busy(pid: int) -> bool:
 
 def run_shell_command(
     cmd: list[str],
+    stdin_text: Optional[str] = None,
     global_timeout: float = GLOBAL_TIMEOUT,
 ) -> Generator[str, None, None]:
     """Execute a command and stream its output line-by-line.
@@ -116,6 +117,7 @@ def run_shell_command(
 
     Args:
         cmd: Command and arguments as a list.
+        stdin_text: Optional text to feed to the process via stdin.
         global_timeout: Maximum total seconds before force-killing.
 
     Yields:
@@ -132,13 +134,21 @@ def run_shell_command(
     process = subprocess.Popen(
         popen_cmd,
         shell=False,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
         encoding="utf-8",
         start_new_session=use_new_session,
     )
+
+    # Write prompt to stdin and close — codex reads it then starts working
+    if stdin_text and process.stdin:
+        try:
+            process.stdin.write(stdin_text)
+            process.stdin.close()
+        except OSError as exc:
+            log.warning("failed to write stdin: %s", exc)
 
     with _child_lock:
         _child_processes.append(process)
@@ -313,7 +323,7 @@ def _kill_process(proc: subprocess.Popen, use_pg: bool) -> None:
 # Core parsing logic (extracted for retry) — runs in a thread, NOT on the
 # asyncio event loop
 # ---------------------------------------------------------------------------
-def _parse_codex_output(cmd: list[str]) -> Dict[str, Any]:
+def _parse_codex_output(cmd: list[str], prompt: str) -> Dict[str, Any]:
     """Run a codex command and parse the JSONL output into a result dict."""
     all_messages: list[Dict[str, Any]] = []
     raw_lines: list[str] = []
@@ -322,7 +332,7 @@ def _parse_codex_output(cmd: list[str]) -> Dict[str, Any]:
     thread_id: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
 
-    for line in run_shell_command(cmd):
+    for line in run_shell_command(cmd, stdin_text=prompt):
         raw_lines.append(line)
         try:
             line_dict = json.loads(line.strip())
@@ -439,6 +449,16 @@ async def codex(
         str,
         "Configuration profile name to load from `~/.codex/config.toml`. This parameter is strictly prohibited unless explicitly specified by the user.",
     ] = "",
+    reasoning_effort: Annotated[
+        Optional[Literal["low", "medium", "high", "xhigh"]],
+        Field(
+            description=(
+                "Override Codex config `model_reasoning_effort` (thinking budget). "
+                "Allowed values: low, medium, high, xhigh. "
+                "If omitted, uses the config/profile default or CODEX_REASONING_EFFORT env var."
+            ),
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Execute a Codex CLI session and return the results."""
 
@@ -458,27 +478,44 @@ async def codex(
         }
 
     # --- build command ---
-    cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd_path), "--json"]
+    # Use --ephemeral to avoid cluttering ~/.codex/sessions with temp files.
+    # Prompt is delivered via stdin ("-") to avoid command-line length limits
+    # and eliminate any need for shell escaping (shell=False + stdin pipe).
+    cmd = [
+        "codex", "exec",
+        "--sandbox", sandbox,
+        "--cd", str(cd_path),
+        "--json",
+        "--ephemeral",
+    ]
 
     images = list(image) if image else []
     if images:
         cmd.extend(["--image", ",".join(str(p) for p in images)])
     if model:
         cmd.extend(["--model", model])
-    if profile:
-        cmd.extend(["--profile", profile])
+
+    # profile: explicit param > env var fallback
+    effective_profile = profile or os.environ.get("CODEX_PROFILE", "")
+    if effective_profile:
+        cmd.extend(["--profile", effective_profile])
+
+    # reasoning_effort: explicit param > env var fallback
+    effective_effort = reasoning_effort or os.environ.get("CODEX_REASONING_EFFORT")
+    if effective_effort:
+        cmd.extend(["--config", f'model_reasoning_effort="{effective_effort}"'])
+
     if yolo:
         cmd.append("--yolo")
     if skip_git_repo_check:
         cmd.append("--skip-git-repo-check")
 
-    # resume is a subcommand that takes [SESSION_ID] [PROMPT] as positional
-    # args; new exec takes [PROMPT] after --.  shell=False means no escaping
-    # is needed — argv is passed directly to execvp.
+    # resume is a subcommand: `resume SESSION_ID -` (stdin)
+    # new exec: `-- -` (stdin)
     if SESSION_ID:
-        cmd.extend(["resume", str(SESSION_ID), PROMPT])
+        cmd.extend(["resume", str(SESSION_ID), "-"])
     else:
-        cmd += ["--", PROMPT]
+        cmd += ["--", "-"]
 
     # --- execute with retry ---
     # CRITICAL: use asyncio.to_thread() so the blocking subprocess work
@@ -493,7 +530,7 @@ async def codex(
 
     for attempt in range(1, MAX_RETRIES + 1):
         log.info("codex attempt %d/%d", attempt, MAX_RETRIES)
-        parsed = await asyncio.to_thread(_parse_codex_output, cmd)
+        parsed = await asyncio.to_thread(_parse_codex_output, cmd, PROMPT)
         last_parsed = parsed
 
         if parsed["success"]:
