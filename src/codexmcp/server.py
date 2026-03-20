@@ -14,6 +14,8 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Dict, Generator, List, Literal, Optional
 
@@ -67,18 +69,171 @@ atexit.register(_cleanup_children)
 
 
 # ---------------------------------------------------------------------------
+# StreamProcessor — structured JSONL event parser
+# ---------------------------------------------------------------------------
+@dataclass
+class TaskEvent:
+    """A single parsed event from codex JSONL output."""
+    type: str   # text, thinking, command, tool_call, tool_result, error
+    text: str = ""
+    tool_name: str = ""
+
+
+class StreamProcessor:
+    """Incrementally parses codex exec --json JSONL output into structured events."""
+
+    MAX_RECENT_EVENTS = 50
+    NON_JSON_BUFFER_SIZE = 20
+
+    def __init__(self) -> None:
+        self.agent_messages: str = ""
+        self.thread_id: Optional[str] = None
+        self.usage: Optional[Dict[str, Any]] = None
+        self.errors: list[str] = []
+        self.done: bool = False
+        self.all_messages: list[Dict[str, Any]] = []
+        self.raw_lines: list[str] = []
+        self._events: list[TaskEvent] = []
+        self._non_json_lines: list[str] = []
+
+    def process_line(self, line: str) -> Optional[TaskEvent]:
+        """Parse one JSONL line.  Updates internal state and returns an event."""
+        self.raw_lines.append(line)
+
+        try:
+            data = json.loads(line.strip())
+        except json.JSONDecodeError:
+            self._non_json_lines.append(line[:500])
+            if len(self._non_json_lines) > self.NON_JSON_BUFFER_SIZE:
+                self._non_json_lines = self._non_json_lines[-self.NON_JSON_BUFFER_SIZE:]
+            self.errors.append(f"[non-JSON output] {line}")
+            return None
+
+        self.all_messages.append(data)
+        event_type = data.get("type", "")
+
+        # thread_id
+        if data.get("thread_id") is not None:
+            self.thread_id = data["thread_id"]
+
+        # turn completed — extract usage, mark done
+        if event_type == "turn.completed":
+            turn_usage = data.get("usage")
+            if turn_usage:
+                self.usage = turn_usage
+            self.done = True
+            return None
+
+        # item events
+        if event_type in ("item.completed", "item.started"):
+            return self._process_item(data.get("item", {}))
+
+        # error events
+        if "fail" in event_type:
+            detail = data.get("error", {}).get("message", "unknown failure")
+            self.errors.append(f"[codex fail] {detail}")
+            evt = TaskEvent(type="error", text=detail)
+            self._push_event(evt)
+            return evt
+
+        if "error" in event_type:
+            msg = data.get("message", "")
+            if not re.match(r"^Reconnecting\.\.\.\s+\d+/\d+", msg):
+                self.errors.append(f"[codex error] {msg}")
+                evt = TaskEvent(type="error", text=msg)
+                self._push_event(evt)
+                return evt
+
+        return None
+
+    def _process_item(self, item: dict) -> Optional[TaskEvent]:
+        item_type = item.get("type", "")
+        evt: Optional[TaskEvent] = None
+
+        if item_type == "agent_message":
+            text = item.get("text", "")
+            self.agent_messages += text
+            evt = TaskEvent(type="text", text=text[:500])
+
+        elif item_type == "reasoning":
+            thinking = item.get("summary", [])
+            text = thinking[0].get("text", "") if thinking else ""
+            evt = TaskEvent(type="thinking", text=text[:300])
+
+        elif item_type == "command_execution":
+            cmd_str = item.get("command", "")
+            exit_code = item.get("exit_code")
+            evt = TaskEvent(type="command", text=f"{cmd_str} (exit={exit_code})")
+
+        elif item_type == "function_call":
+            evt = TaskEvent(
+                type="tool_call",
+                tool_name=item.get("name", ""),
+                text=str(item.get("arguments", ""))[:300],
+            )
+
+        elif item_type == "function_call_output":
+            output = item.get("output", "")
+            evt = TaskEvent(type="tool_result", text=str(output)[:300])
+
+        if evt:
+            self._push_event(evt)
+        return evt
+
+    def _push_event(self, evt: TaskEvent) -> None:
+        self._events.append(evt)
+        if len(self._events) > self.MAX_RECENT_EVENTS:
+            self._events = self._events[-self.MAX_RECENT_EVENTS:]
+
+    def recent_events(self, n: int = 20) -> list[dict]:
+        return [
+            {"type": e.type, "text": e.text, "tool_name": e.tool_name}
+            for e in self._events[-n:]
+        ]
+
+    @property
+    def success(self) -> bool:
+        return bool(self.agent_messages) and self.thread_id is not None
+
+    def to_result(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "agent_messages": self.agent_messages,
+            "thread_id": self.thread_id,
+            "all_messages": self.all_messages,
+            "errors": self.errors,
+            "raw_lines": self.raw_lines,
+            "usage": self.usage,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Background task registry
+# ---------------------------------------------------------------------------
+@dataclass
+class _TaskState:
+    task_id: str
+    prompt_preview: str
+    cd: str
+    status: str = "running"      # running | completed | failed | cancelled
+    started_at: float = field(default_factory=time.monotonic)
+    completed_at: Optional[float] = None
+    stream: StreamProcessor = field(default_factory=StreamProcessor)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    _asyncio_task: Optional[asyncio.Task] = field(default=None, repr=False)
+
+
+_task_registry: Dict[str, _TaskState] = {}
+_registry_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
 # Subprocess runner with timeout
 # ---------------------------------------------------------------------------
 def _is_process_busy(pid: int) -> bool:
-    """Check if a process or any of its descendants is consuming CPU.
-
-    Uses pgrep to find all processes in the same process group, then sums
-    their CPU usage.  Returns True (fail-open) if we can't determine status.
-    """
+    """Check if a process or any of its descendants is consuming CPU."""
     try:
-        # Get process group ID — matches start_new_session=True
         pgid = os.getpgid(pid)
-        # Find all PIDs in the process group
         pgrep = subprocess.run(
             ["pgrep", "-g", str(pgid)],
             capture_output=True, text=True, timeout=3,
@@ -86,8 +241,6 @@ def _is_process_busy(pid: int) -> bool:
         pids = pgrep.stdout.strip()
         if not pids:
             return False
-
-        # Sum CPU across all processes in the group
         pid_list = ",".join(pids.split())
         ps_result = subprocess.run(
             ["ps", "-o", "%cpu=", "-p", pid_list],
@@ -100,35 +253,24 @@ def _is_process_busy(pid: int) -> bool:
         )
         return total_cpu > 0.5
     except Exception:
-        return True  # fail-open: assume busy if we can't check
+        return True
 
 
 def run_shell_command(
     cmd: list[str],
     stdin_text: Optional[str] = None,
     global_timeout: float = GLOBAL_TIMEOUT,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Generator[str, None, None]:
     """Execute a command and stream its output line-by-line.
 
     Uses adaptive idle timeout: short before first output (fast failure
     detection), long after first output (allow deep model reasoning).
-    When idle timeout is about to fire, checks process CPU to distinguish
-    'still thinking' from 'truly hung'.
-
-    Args:
-        cmd: Command and arguments as a list.
-        stdin_text: Optional text to feed to the process via stdin.
-        global_timeout: Maximum total seconds before force-killing.
-
-    Yields:
-        Output lines (stripped) from the command.
     """
     popen_cmd = cmd.copy()
     codex_path = shutil.which("codex") or cmd[0]
     popen_cmd[0] = codex_path
 
-    # Use start_new_session on Unix so child gets its own process group,
-    # allowing us to kill it and all its descendants cleanly.
     use_new_session = os.name != "nt"
 
     process = subprocess.Popen(
@@ -142,7 +284,6 @@ def run_shell_command(
         start_new_session=use_new_session,
     )
 
-    # Write prompt to stdin and close — codex reads it then starts working
     if stdin_text and process.stdin:
         try:
             process.stdin.write(stdin_text)
@@ -191,8 +332,14 @@ def run_shell_command(
     last_output_time = start_time
     got_first_output = False
     timed_out = False
+    cancelled = False
 
     while True:
+        # Check external cancel signal
+        if cancel_event and cancel_event.is_set():
+            cancelled = True
+            break
+
         elapsed = time.monotonic() - start_time
         idle_elapsed = time.monotonic() - last_output_time
         idle_limit = IDLE_TIMEOUT_ACTIVE if got_first_output else IDLE_TIMEOUT_INITIAL
@@ -202,13 +349,11 @@ def run_shell_command(
             break
 
         if idle_elapsed > idle_limit:
-            # Before killing, check if process is still actively working
             if process.poll() is None and _is_process_busy(process.pid):
                 log.info(
-                    "idle timeout (%.0fs) reached but process pid=%d still busy, extending",
+                    "idle timeout (%.0fs) reached but pid=%d still busy, extending",
                     idle_elapsed, process.pid,
                 )
-                # Reset idle timer — process is still working
                 last_output_time = time.monotonic()
                 continue
             timed_out = True
@@ -227,21 +372,21 @@ def run_shell_command(
                 break
 
     # --- cleanup ---
-    if timed_out:
+    if timed_out or cancelled:
         abort_event.set()
-        timeout_kind = "global" if elapsed > global_timeout else "idle"
-        log.warning(
-            "codex process timed out (%s, pid=%d, elapsed=%.0fs, idle=%.0fs), killing",
-            timeout_kind, process.pid, elapsed, idle_elapsed,
+        reason = "cancelled" if cancelled else (
+            "global" if elapsed > global_timeout else "idle"
         )
+        log.warning("codex process %s (pid=%d), killing", reason, process.pid)
         _kill_process(process, use_new_session)
-        yield json.dumps({
-            "type": "error",
-            "message": (
-                f"codex process killed: {timeout_kind} timeout "
-                f"({global_timeout}s global / {idle_limit}s idle) exceeded"
-            ),
-        })
+        if timed_out:
+            yield json.dumps({
+                "type": "error",
+                "message": (
+                    f"codex process killed: {reason} timeout "
+                    f"({global_timeout}s global / {idle_limit}s idle) exceeded"
+                ),
+            })
     else:
         try:
             process.wait(timeout=5)
@@ -250,8 +395,6 @@ def run_shell_command(
 
     thread.join(timeout=10)
 
-    # drain remaining — thread may have enqueued lines between our last read
-    # and the join; exhaust the queue before checking exit code
     while True:
         try:
             line = output_queue.get_nowait()
@@ -261,11 +404,8 @@ def run_shell_command(
         except queue.Empty:
             break
 
-    # surface non-zero exit code — read after join to ensure wait() has been
-    # called by cleanup above
     rc = process.returncode
     if rc is None:
-        # Belt-and-suspenders: if somehow we didn't wait yet
         try:
             rc = process.wait(timeout=3)
         except subprocess.TimeoutExpired:
@@ -288,7 +428,6 @@ def run_shell_command(
 
 
 def _terminate_process(proc: subprocess.Popen, use_pg: bool) -> None:
-    """Send SIGTERM, preferring the process group on Unix."""
     try:
         if use_pg:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -299,7 +438,6 @@ def _terminate_process(proc: subprocess.Popen, use_pg: bool) -> None:
 
 
 def _kill_process(proc: subprocess.Popen, use_pg: bool) -> None:
-    """Escalate: SIGTERM → wait → SIGKILL."""
     _terminate_process(proc, use_pg)
     try:
         proc.wait(timeout=3)
@@ -317,170 +455,39 @@ def _kill_process(proc: subprocess.Popen, use_pg: bool) -> None:
             pass
 
 
-
-
 # ---------------------------------------------------------------------------
-# Core parsing logic (extracted for retry) — runs in a thread, NOT on the
-# asyncio event loop
+# Core parsing logic — uses StreamProcessor, runs in a thread
 # ---------------------------------------------------------------------------
-def _parse_codex_output(cmd: list[str], prompt: str) -> Dict[str, Any]:
-    """Run a codex command and parse the JSONL output into a result dict."""
-    all_messages: list[Dict[str, Any]] = []
-    raw_lines: list[str] = []
-    agent_messages = ""
-    errors: list[str] = []
-    thread_id: Optional[str] = None
-    usage: Optional[Dict[str, Any]] = None
-
-    for line in run_shell_command(cmd, stdin_text=prompt):
-        raw_lines.append(line)
-        try:
-            line_dict = json.loads(line.strip())
-            all_messages.append(line_dict)
-
-            line_type = line_dict.get("type", "")
-
-            # extract thread_id
-            if line_dict.get("thread_id") is not None:
-                thread_id = line_dict["thread_id"]
-
-            # extract agent text
-            item = line_dict.get("item", {})
-            if item.get("type") == "agent_message":
-                agent_messages += item.get("text", "")
-
-            # extract token usage from turn.completed
-            if line_type == "turn.completed":
-                turn_usage = line_dict.get("usage")
-                if turn_usage:
-                    usage = turn_usage
-
-            # capture errors
-            if "fail" in line_type:
-                err_detail = line_dict.get("error", {}).get("message", "unknown failure")
-                errors.append(f"[codex fail] {err_detail}")
-            elif "error" in line_type:
-                error_msg = line_dict.get("message", "")
-                is_reconnecting = bool(
-                    re.match(r"^Reconnecting\.\.\.\s+\d+/\d+", error_msg)
-                )
-                if not is_reconnecting:
-                    errors.append(f"[codex error] {error_msg}")
-
-        except json.JSONDecodeError:
-            errors.append(f"[non-JSON output] {line}")
-        except Exception as exc:
-            errors.append(f"[unexpected error] {exc!r} — line: {line!r}")
-
-    return {
-        "success": bool(agent_messages) and thread_id is not None,
-        "agent_messages": agent_messages,
-        "thread_id": thread_id,
-        "all_messages": all_messages,
-        "errors": errors,
-        "raw_lines": raw_lines,
-        "usage": usage,
-    }
-
-
-# ---------------------------------------------------------------------------
-# MCP tool
-# ---------------------------------------------------------------------------
-@mcp.tool(
-    name="codex",
-    description="""
-    Executes a non-interactive Codex session via CLI to perform AI-assisted coding tasks in a secure workspace.
-    This tool wraps the `codex exec` command, enabling model-driven code generation, debugging, or automation based on natural language prompts.
-    It supports resuming ongoing sessions for continuity and enforces sandbox policies to prevent unsafe operations. Ideal for integrating Codex into MCP servers for agentic workflows, such as code reviews or repo modifications.
-
-    **Key Features:**
-        - **Prompt-Driven Execution:** Send task instructions to Codex for step-by-step code handling.
-        - **Workspace Isolation:** Operate within a specified directory, with optional Git repo skipping.
-        - **Security Controls:** Three sandbox levels balance functionality and safety.
-        - **Session Persistence:** Resume prior conversations via `SESSION_ID` for iterative tasks.
-
-    **Edge Cases & Best Practices:**
-        - Ensure `cd` exists and is accessible; tool fails silently on invalid paths.
-        - For most repos, prefer "read-only" to avoid accidental changes.
-        - If needed, set `return_all_messages` to `True` to parse "all_messages" for detailed tracing (e.g., reasoning, tool calls, etc.).
-    """,
-    meta={"version": "0.0.0", "author": "guda.studio"},
-)
-async def codex(
-    PROMPT: Annotated[str, "Instruction for the task to send to codex."],
-    cd: Annotated[Path, "Set the workspace root for codex before executing the task."],
-    sandbox: Annotated[
-        Literal["read-only", "workspace-write", "danger-full-access"],
-        Field(
-            description="Sandbox policy for model-generated commands. Defaults to `read-only`."
-        ),
-    ] = "read-only",
-    SESSION_ID: Annotated[
-        str,
-        "Resume the specified session of the codex. Defaults to `None`, start a new session.",
-    ] = "",
-    skip_git_repo_check: Annotated[
-        bool,
-        "Allow codex running outside a Git repository (useful for one-off directories).",
-    ] = True,
-    return_all_messages: Annotated[
-        bool,
-        "Return all messages (e.g. reasoning, tool calls, etc.) from the codex session. Set to `False` by default, only the agent's final reply message is returned.",
-    ] = False,
-    image: Annotated[
-        Optional[List[Path]],
-        Field(
-            description="Attach one or more image files to the initial prompt. Separate multiple paths with commas or repeat the flag.",
-        ),
-    ] = None,
-    model: Annotated[
-        str,
-        Field(
-            description="The model to use for the codex session. This parameter is strictly prohibited unless explicitly specified by the user.",
-        ),
-    ] = "",
-    yolo: Annotated[
-        bool,
-        Field(
-            description="Run every command without approvals or sandboxing. Only use when `sandbox` couldn't be applied.",
-        ),
-    ] = False,
-    profile: Annotated[
-        str,
-        "Configuration profile name to load from `~/.codex/config.toml`. This parameter is strictly prohibited unless explicitly specified by the user.",
-    ] = "",
-    reasoning_effort: Annotated[
-        Optional[Literal["low", "medium", "high", "xhigh"]],
-        Field(
-            description=(
-                "Override Codex config `model_reasoning_effort` (thinking budget). "
-                "Allowed values: low, medium, high, xhigh. "
-                "If omitted, uses the config/profile default or CODEX_REASONING_EFFORT env var."
-            ),
-        ),
-    ] = None,
+def _parse_codex_output(
+    cmd: list[str],
+    prompt: str,
+    stream: Optional[StreamProcessor] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
-    """Execute a Codex CLI session and return the results."""
+    """Run a codex command and parse JSONL output via StreamProcessor."""
+    sp = stream or StreamProcessor()
 
-    # --- pre-flight validation ---
-    cd_path = Path(cd)
-    if not cd_path.exists():
-        return {
-            "success": False,
-            "error": f"Working directory does not exist: {cd_path}",
-        }
+    for line in run_shell_command(cmd, stdin_text=prompt, cancel_event=cancel_event):
+        sp.process_line(line)
 
-    codex_bin = shutil.which("codex")
-    if not codex_bin:
-        return {
-            "success": False,
-            "error": "codex CLI not found in PATH. Install it first.",
-        }
+    return sp.to_result()
 
-    # --- build command ---
-    # Use --ephemeral to avoid cluttering ~/.codex/sessions with temp files.
-    # Prompt is delivered via stdin ("-") to avoid command-line length limits
-    # and eliminate any need for shell escaping (shell=False + stdin pipe).
+
+# ---------------------------------------------------------------------------
+# Shared command builder
+# ---------------------------------------------------------------------------
+def _build_codex_cmd(
+    sandbox: str,
+    cd_path: Path,
+    session_id: str = "",
+    image: Optional[List[Path]] = None,
+    model: str = "",
+    profile: str = "",
+    reasoning_effort: Optional[str] = None,
+    yolo: bool = False,
+    skip_git_repo_check: bool = True,
+) -> list[str]:
+    """Build the codex exec CLI command list."""
     cmd = [
         "codex", "exec",
         "--sandbox", sandbox,
@@ -495,12 +502,10 @@ async def codex(
     if model:
         cmd.extend(["--model", model])
 
-    # profile: explicit param > env var fallback
     effective_profile = profile or os.environ.get("CODEX_PROFILE", "")
     if effective_profile:
         cmd.extend(["--profile", effective_profile])
 
-    # reasoning_effort: explicit param > env var fallback
     effective_effort = reasoning_effort or os.environ.get("CODEX_REASONING_EFFORT")
     if effective_effort:
         cmd.extend(["--config", f'model_reasoning_effort="{effective_effort}"'])
@@ -510,60 +515,25 @@ async def codex(
     if skip_git_repo_check:
         cmd.append("--skip-git-repo-check")
 
-    # resume is a subcommand: `resume SESSION_ID -` (stdin)
-    # new exec: `-- -` (stdin)
-    if SESSION_ID:
-        cmd.extend(["resume", str(SESSION_ID), "-"])
+    if session_id:
+        cmd.extend(["resume", session_id, "-"])
     else:
         cmd += ["--", "-"]
 
-    # --- execute with retry ---
-    # CRITICAL: use asyncio.to_thread() so the blocking subprocess work
-    # runs in a thread pool instead of freezing the MCP event loop.
-    #
-    # Retry policy: only retry transient/empty failures.  Skip retry when:
-    #  - we got partial agent content (may have side-effects already)
-    #  - resuming a session (replay could cause duplicate actions)
-    #  - deterministic CLI errors (exit code 2 = usage error)
-    is_resume = bool(SESSION_ID)
-    last_parsed: Optional[Dict[str, Any]] = None
+    return cmd
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        log.info("codex attempt %d/%d", attempt, MAX_RETRIES)
-        parsed = await asyncio.to_thread(_parse_codex_output, cmd, PROMPT)
-        last_parsed = parsed
 
-        if parsed["success"]:
-            break
+def _preflight(cd: Path) -> Optional[Dict[str, Any]]:
+    """Run pre-flight checks.  Returns an error dict or None if OK."""
+    if not cd.exists():
+        return {"success": False, "error": f"Working directory does not exist: {cd}"}
+    if not shutil.which("codex"):
+        return {"success": False, "error": "codex CLI not found in PATH."}
+    return None
 
-        # don't retry if we got partial agent content (side-effects possible)
-        if parsed["agent_messages"]:
-            break
 
-        # don't retry resume — replaying could duplicate tool actions
-        if is_resume:
-            break
-
-        # don't retry deterministic errors (non-JSON = CLI usage/config error)
-        has_only_deterministic_errors = (
-            parsed["errors"]
-            and all("[non-JSON output]" in e for e in parsed["errors"])
-        )
-        if has_only_deterministic_errors:
-            break
-
-        if attempt < MAX_RETRIES:
-            log.info(
-                "codex attempt %d failed (%s), retrying in %ds",
-                attempt,
-                "; ".join(parsed["errors"][:3]) or "no output",
-                RETRY_DELAY,
-            )
-            await asyncio.sleep(RETRY_DELAY)
-
-    parsed = last_parsed  # type: ignore[assignment]
-
-    # --- build response ---
+def _build_response(parsed: Dict[str, Any], return_all: bool) -> Dict[str, Any]:
+    """Build the final MCP response from parsed output."""
     if parsed["success"]:
         result: Dict[str, Any] = {
             "success": True,
@@ -595,12 +565,314 @@ async def codex(
         if parsed["thread_id"]:
             result["SESSION_ID"] = parsed["thread_id"]
 
-    if return_all_messages:
+    if return_all:
         result["all_messages"] = parsed["all_messages"]
 
     return result
 
 
+# ---------------------------------------------------------------------------
+# MCP tool: codex (blocking)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="codex",
+    description="""
+    Executes a non-interactive Codex session via CLI and **waits** for completion.
+    Use this for tasks where you need the result immediately (code review, quick questions, etc.).
+    For long-running tasks, use `codex_dispatch` instead.
+
+    **Key Features:**
+        - **Prompt-Driven Execution:** Send task instructions to Codex for step-by-step code handling.
+        - **Workspace Isolation:** Operate within a specified directory, with optional Git repo skipping.
+        - **Security Controls:** Three sandbox levels balance functionality and safety.
+        - **Session Persistence:** Resume prior conversations via `SESSION_ID` for iterative tasks.
+        - **Auto-Retry:** Transient failures are retried automatically (up to 2 attempts).
+    """,
+    meta={"version": "0.0.0", "author": "guda.studio"},
+)
+async def codex(
+    PROMPT: Annotated[str, "Instruction for the task to send to codex."],
+    cd: Annotated[Path, "Set the workspace root for codex before executing the task."],
+    sandbox: Annotated[
+        Literal["read-only", "workspace-write", "danger-full-access"],
+        Field(description="Sandbox policy. Defaults to `read-only`."),
+    ] = "read-only",
+    SESSION_ID: Annotated[
+        str, "Resume a previous session. Defaults to empty (new session).",
+    ] = "",
+    skip_git_repo_check: Annotated[
+        bool, "Allow running outside a Git repository.",
+    ] = True,
+    return_all_messages: Annotated[
+        bool, "Return all messages including reasoning and tool calls.",
+    ] = False,
+    image: Annotated[
+        Optional[List[Path]],
+        Field(description="Attach image files to the prompt."),
+    ] = None,
+    model: Annotated[
+        str,
+        Field(description="Model override. Prohibited unless user specifies."),
+    ] = "",
+    yolo: Annotated[
+        bool,
+        Field(description="Skip all approvals and sandboxing."),
+    ] = False,
+    profile: Annotated[
+        str, "Config profile from ~/.codex/config.toml.",
+    ] = "",
+    reasoning_effort: Annotated[
+        Optional[Literal["low", "medium", "high", "xhigh"]],
+        Field(description="Thinking budget override (low/medium/high/xhigh)."),
+    ] = None,
+) -> Dict[str, Any]:
+    """Execute a Codex CLI session and wait for the result."""
+
+    cd_path = Path(cd)
+    err = _preflight(cd_path)
+    if err:
+        return err
+
+    cmd = _build_codex_cmd(
+        sandbox=sandbox, cd_path=cd_path, session_id=SESSION_ID,
+        image=image, model=model, profile=profile,
+        reasoning_effort=reasoning_effort, yolo=yolo,
+        skip_git_repo_check=skip_git_repo_check,
+    )
+
+    is_resume = bool(SESSION_ID)
+    last_parsed: Optional[Dict[str, Any]] = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        log.info("codex attempt %d/%d", attempt, MAX_RETRIES)
+        parsed = await asyncio.to_thread(_parse_codex_output, cmd, PROMPT)
+        last_parsed = parsed
+
+        if parsed["success"]:
+            break
+        if parsed["agent_messages"]:
+            break
+        if is_resume:
+            break
+        if parsed["errors"] and all("[non-JSON output]" in e for e in parsed["errors"]):
+            break
+
+        if attempt < MAX_RETRIES:
+            log.info(
+                "codex attempt %d failed (%s), retrying in %ds",
+                attempt, "; ".join(parsed["errors"][:3]) or "no output", RETRY_DELAY,
+            )
+            await asyncio.sleep(RETRY_DELAY)
+
+    parsed = last_parsed  # type: ignore[assignment]
+    return _build_response(parsed, return_all_messages)
+
+
+# ---------------------------------------------------------------------------
+# MCP tool: codex_dispatch (background, non-blocking)
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="codex_dispatch",
+    description="""
+    Dispatch a Codex task to run **in the background** and return immediately with a `task_id`.
+    Use this for long-running tasks (large code reviews, complex implementations, multi-file refactors).
+    Check progress with `codex_status` and cancel with `codex_cancel`.
+    """,
+)
+async def codex_dispatch(
+    PROMPT: Annotated[str, "Instruction for the task to send to codex."],
+    cd: Annotated[Path, "Set the workspace root for codex."],
+    sandbox: Annotated[
+        Literal["read-only", "workspace-write", "danger-full-access"],
+        Field(description="Sandbox policy. Defaults to `read-only`."),
+    ] = "read-only",
+    SESSION_ID: Annotated[str, "Resume a previous session."] = "",
+    skip_git_repo_check: Annotated[bool, "Allow running outside Git repo."] = True,
+    image: Annotated[
+        Optional[List[Path]],
+        Field(description="Attach image files to the prompt."),
+    ] = None,
+    model: Annotated[str, Field(description="Model override.")] = "",
+    yolo: Annotated[bool, Field(description="Skip approvals.")] = False,
+    profile: Annotated[str, "Config profile."] = "",
+    reasoning_effort: Annotated[
+        Optional[Literal["low", "medium", "high", "xhigh"]],
+        Field(description="Thinking budget override."),
+    ] = None,
+) -> Dict[str, Any]:
+    """Start a background Codex task and return its task_id immediately."""
+
+    cd_path = Path(cd)
+    err = _preflight(cd_path)
+    if err:
+        return err
+
+    cmd = _build_codex_cmd(
+        sandbox=sandbox, cd_path=cd_path, session_id=SESSION_ID,
+        image=image, model=model, profile=profile,
+        reasoning_effort=reasoning_effort, yolo=yolo,
+        skip_git_repo_check=skip_git_repo_check,
+    )
+
+    task_id = str(uuid.uuid4())[:8]
+    state = _TaskState(
+        task_id=task_id,
+        prompt_preview=PROMPT[:200],
+        cd=str(cd_path),
+    )
+
+    with _registry_lock:
+        _task_registry[task_id] = state
+
+    async def _run() -> None:
+        try:
+            await asyncio.to_thread(
+                _parse_codex_output, cmd, PROMPT,
+                stream=state.stream,
+                cancel_event=state.cancel_event,
+            )
+            # Don't overwrite if already cancelled by codex_cancel
+            if state.status == "running":
+                state.status = "completed" if state.stream.success else "failed"
+        except Exception as exc:
+            state.stream.errors.append(f"[dispatch error] {exc!r}")
+            if state.status == "running":
+                state.status = "failed"
+        finally:
+            if state.completed_at is None:
+                state.completed_at = time.monotonic()
+            log.info("dispatch task %s finished: %s", task_id, state.status)
+
+    state._asyncio_task = asyncio.create_task(_run())
+
+    return {
+        "task_id": task_id,
+        "status": "running",
+        "prompt_preview": state.prompt_preview,
+        "cd": state.cd,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MCP tool: codex_status
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="codex_status",
+    description="""
+    Query the status of background Codex tasks.
+    - With `task_id`: returns detailed status, progress events, and result (if complete).
+    - Without `task_id`: lists all tracked tasks with their status.
+    """,
+)
+async def codex_status(
+    task_id: Annotated[
+        str, "Task ID to query. Leave empty to list all tasks.",
+    ] = "",
+) -> Dict[str, Any]:
+    """Query background task status."""
+
+    if not task_id:
+        with _registry_lock:
+            tasks = list(_task_registry.values())
+        return {
+            "tasks": [
+                {
+                    "task_id": t.task_id,
+                    "status": t.status,
+                    "prompt_preview": t.prompt_preview,
+                    "cd": t.cd,
+                    "elapsed_seconds": round(
+                        (t.completed_at or time.monotonic()) - t.started_at, 1
+                    ),
+                }
+                for t in tasks
+            ]
+        }
+
+    with _registry_lock:
+        state = _task_registry.get(task_id)
+
+    if not state:
+        return {"success": False, "error": f"Task '{task_id}' not found."}
+
+    sp = state.stream
+    elapsed = round((state.completed_at or time.monotonic()) - state.started_at, 1)
+
+    result: Dict[str, Any] = {
+        "task_id": state.task_id,
+        "status": state.status,
+        "prompt_preview": state.prompt_preview,
+        "cd": state.cd,
+        "elapsed_seconds": elapsed,
+        "recent_events": sp.recent_events(20),
+        "errors": sp.errors[-10:] if sp.errors else [],
+    }
+
+    if state.status != "running":
+        result["agent_messages"] = sp.agent_messages
+        result["SESSION_ID"] = sp.thread_id
+        if sp.usage:
+            result["usage"] = sp.usage
+
+    else:
+        # Show partial progress for running tasks
+        if sp.agent_messages:
+            result["agent_messages_preview"] = sp.agent_messages[-500:]
+        result["events_count"] = len(sp.all_messages)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# MCP tool: codex_cancel
+# ---------------------------------------------------------------------------
+@mcp.tool(
+    name="codex_cancel",
+    description="Cancel a running background Codex task by its `task_id`.",
+)
+async def codex_cancel(
+    task_id: Annotated[str, "The task ID to cancel."],
+) -> Dict[str, Any]:
+    """Cancel a background task."""
+
+    with _registry_lock:
+        state = _task_registry.get(task_id)
+
+    if not state:
+        return {"success": False, "error": f"Task '{task_id}' not found."}
+
+    if state.status != "running":
+        return {
+            "success": False,
+            "error": f"Task '{task_id}' is not running (status: {state.status}).",
+        }
+
+    # Signal cancellation — run_shell_command checks this event
+    state.cancel_event.set()
+    state.status = "cancelled"
+    state.completed_at = time.monotonic()
+
+    # Wait briefly for the asyncio task to finish cleanup
+    if state._asyncio_task and not state._asyncio_task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(state._asyncio_task), timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
+    elapsed = round(state.completed_at - state.started_at, 1)
+    log.info("task %s cancelled after %.1fs", task_id, elapsed)
+
+    return {
+        "task_id": task_id,
+        "status": "cancelled",
+        "elapsed_seconds": elapsed,
+        "partial_agent_messages": state.stream.agent_messages[:500] if state.stream.agent_messages else "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Server entry point
+# ---------------------------------------------------------------------------
 def run() -> None:
     """Start the MCP server over stdio transport."""
     mcp.run(transport="stdio")
