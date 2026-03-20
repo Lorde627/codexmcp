@@ -70,18 +70,35 @@ atexit.register(_cleanup_children)
 # Subprocess runner with timeout
 # ---------------------------------------------------------------------------
 def _is_process_busy(pid: int) -> bool:
-    """Check if a process is still consuming CPU (not just sleeping/hung).
+    """Check if a process or any of its descendants is consuming CPU.
 
-    Uses /proc or ps to detect whether the child is actively working.
-    Returns True if we can't determine status (fail-open).
+    Uses pgrep to find all processes in the same process group, then sums
+    their CPU usage.  Returns True (fail-open) if we can't determine status.
     """
     try:
-        result = subprocess.run(
-            ["ps", "-o", "%cpu=", "-p", str(pid)],
+        # Get process group ID — matches start_new_session=True
+        pgid = os.getpgid(pid)
+        # Find all PIDs in the process group
+        pgrep = subprocess.run(
+            ["pgrep", "-g", str(pgid)],
             capture_output=True, text=True, timeout=3,
         )
-        cpu = float(result.stdout.strip())
-        return cpu > 0.1
+        pids = pgrep.stdout.strip()
+        if not pids:
+            return False
+
+        # Sum CPU across all processes in the group
+        pid_list = ",".join(pids.split())
+        ps_result = subprocess.run(
+            ["ps", "-o", "%cpu=", "-p", pid_list],
+            capture_output=True, text=True, timeout=3,
+        )
+        total_cpu = sum(
+            float(line.strip())
+            for line in ps_result.stdout.strip().splitlines()
+            if line.strip()
+        )
+        return total_cpu > 0.5
     except Exception:
         return True  # fail-open: assume busy if we can't check
 
@@ -221,19 +238,28 @@ def run_shell_command(
         except subprocess.TimeoutExpired:
             _kill_process(process, use_new_session)
 
-    thread.join(timeout=5)
+    thread.join(timeout=10)
 
-    # drain remaining
-    while not output_queue.empty():
+    # drain remaining — thread may have enqueued lines between our last read
+    # and the join; exhaust the queue before checking exit code
+    while True:
         try:
             line = output_queue.get_nowait()
-            if line is not None:
-                yield line
+            if line is None:
+                break
+            yield line
         except queue.Empty:
             break
 
-    # surface non-zero exit code
+    # surface non-zero exit code — read after join to ensure wait() has been
+    # called by cleanup above
     rc = process.returncode
+    if rc is None:
+        # Belt-and-suspenders: if somehow we didn't wait yet
+        try:
+            rc = process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            rc = -1
     if rc and rc != 0:
         log.warning("codex process exited with code %d", rc)
         yield json.dumps({
@@ -281,16 +307,6 @@ def _kill_process(proc: subprocess.Popen, use_pg: bool) -> None:
             pass
 
 
-def windows_escape(prompt: str) -> str:
-    result = prompt.replace("\\", "\\\\")
-    result = result.replace('"', '\\"')
-    result = result.replace("\n", "\\n")
-    result = result.replace("\r", "\\r")
-    result = result.replace("\t", "\\t")
-    result = result.replace("\b", "\\b")
-    result = result.replace("\f", "\\f")
-    result = result.replace("'", "\\'")
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -402,11 +418,11 @@ async def codex(
         "Return all messages (e.g. reasoning, tool calls, etc.) from the codex session. Set to `False` by default, only the agent's final reply message is returned.",
     ] = False,
     image: Annotated[
-        List[Path],
+        Optional[List[Path]],
         Field(
             description="Attach one or more image files to the initial prompt. Separate multiple paths with commas or repeat the flag.",
         ),
-    ] = [],
+    ] = None,
     model: Annotated[
         str,
         Field(
@@ -444,8 +460,9 @@ async def codex(
     # --- build command ---
     cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd_path), "--json"]
 
-    if image:
-        cmd.extend(["--image", ",".join(str(p) for p in image)])
+    images = list(image) if image else []
+    if images:
+        cmd.extend(["--image", ",".join(str(p) for p in images)])
     if model:
         cmd.extend(["--model", model])
     if profile:
@@ -454,15 +471,24 @@ async def codex(
         cmd.append("--yolo")
     if skip_git_repo_check:
         cmd.append("--skip-git-repo-check")
-    if SESSION_ID:
-        cmd.extend(["resume", str(SESSION_ID)])
 
-    prompt_text = windows_escape(PROMPT) if os.name == "nt" else PROMPT
-    cmd += ["--", prompt_text]
+    # resume is a subcommand that takes [SESSION_ID] [PROMPT] as positional
+    # args; new exec takes [PROMPT] after --.  shell=False means no escaping
+    # is needed — argv is passed directly to execvp.
+    if SESSION_ID:
+        cmd.extend(["resume", str(SESSION_ID), PROMPT])
+    else:
+        cmd += ["--", PROMPT]
 
     # --- execute with retry ---
     # CRITICAL: use asyncio.to_thread() so the blocking subprocess work
     # runs in a thread pool instead of freezing the MCP event loop.
+    #
+    # Retry policy: only retry transient/empty failures.  Skip retry when:
+    #  - we got partial agent content (may have side-effects already)
+    #  - resuming a session (replay could cause duplicate actions)
+    #  - deterministic CLI errors (exit code 2 = usage error)
+    is_resume = bool(SESSION_ID)
     last_parsed: Optional[Dict[str, Any]] = None
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -473,8 +499,20 @@ async def codex(
         if parsed["success"]:
             break
 
-        # don't retry if we already got partial agent content
+        # don't retry if we got partial agent content (side-effects possible)
         if parsed["agent_messages"]:
+            break
+
+        # don't retry resume — replaying could duplicate tool actions
+        if is_resume:
+            break
+
+        # don't retry deterministic errors (non-JSON = CLI usage/config error)
+        has_only_deterministic_errors = (
+            parsed["errors"]
+            and all("[non-JSON output]" in e for e in parsed["errors"])
+        )
+        if has_only_deterministic_errors:
             break
 
         if attempt < MAX_RETRIES:
