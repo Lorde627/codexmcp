@@ -42,7 +42,8 @@ IDLE_TIMEOUT_INITIAL = 120 # 2 min before first output → fast startup-failure 
 IDLE_TIMEOUT_ACTIVE = 480  # 8 min after first output → allow deep reasoning
 MAX_RETRIES = 2            # retry up to 2 times on transient failure
 RETRY_DELAY = 3            # seconds between retries
-GRACEFUL_SHUTDOWN_DELAY = 0.3
+TASK_RETENTION_SECONDS = 3600  # prune completed tasks after 1 hour
+MAX_TRACKED_TASKS = 200        # hard cap on registry size
 
 # Track child processes for cleanup on server exit
 _child_processes: list[subprocess.Popen] = []
@@ -52,14 +53,10 @@ _child_lock = threading.Lock()
 def _cleanup_children() -> None:
     """Kill any lingering codex child processes on server exit."""
     with _child_lock:
-        for proc in _child_processes:
+        for proc in list(_child_processes):
             try:
                 if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                    _kill_process(proc, os.name != "nt")
             except OSError:
                 pass
         _child_processes.clear()
@@ -80,12 +77,20 @@ class TaskEvent:
 
 
 class StreamProcessor:
-    """Incrementally parses codex exec --json JSONL output into structured events."""
+    """Incrementally parses codex exec --json JSONL output into structured events.
+
+    Thread-safe: all mutations go through self._lock.  Readers should call
+    snapshot() to get a consistent cross-field view.
+    """
 
     MAX_RECENT_EVENTS = 50
     NON_JSON_BUFFER_SIZE = 20
+    MAX_RAW_LINES = 2000
+    MAX_ALL_MESSAGES = 2000
+    MAX_ERRORS = 200
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.agent_messages: str = ""
         self.thread_id: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
@@ -96,57 +101,69 @@ class StreamProcessor:
         self._events: list[TaskEvent] = []
         self._non_json_lines: list[str] = []
 
+    @staticmethod
+    def _bounded_append(items: list, value: Any, limit: int) -> None:
+        items.append(value)
+        if len(items) > limit:
+            del items[:-limit]
+
     def process_line(self, line: str) -> Optional[TaskEvent]:
         """Parse one JSONL line.  Updates internal state and returns an event."""
-        self.raw_lines.append(line)
+        with self._lock:
+            self._bounded_append(self.raw_lines, line, self.MAX_RAW_LINES)
 
         try:
             data = json.loads(line.strip())
         except json.JSONDecodeError:
-            self._non_json_lines.append(line[:500])
-            if len(self._non_json_lines) > self.NON_JSON_BUFFER_SIZE:
-                self._non_json_lines = self._non_json_lines[-self.NON_JSON_BUFFER_SIZE:]
-            self.errors.append(f"[non-JSON output] {line}")
+            with self._lock:
+                self._bounded_append(
+                    self._non_json_lines, line[:500], self.NON_JSON_BUFFER_SIZE
+                )
+                self._bounded_append(
+                    self.errors, f"[non-JSON output] {line}", self.MAX_ERRORS
+                )
             return None
 
-        self.all_messages.append(data)
-        event_type = data.get("type", "")
+        with self._lock:
+            self._bounded_append(self.all_messages, data, self.MAX_ALL_MESSAGES)
+            event_type = data.get("type", "")
 
-        # thread_id
-        if data.get("thread_id") is not None:
-            self.thread_id = data["thread_id"]
+            if data.get("thread_id") is not None:
+                self.thread_id = data["thread_id"]
 
-        # turn completed — extract usage, mark done
-        if event_type == "turn.completed":
-            turn_usage = data.get("usage")
-            if turn_usage:
-                self.usage = turn_usage
-            self.done = True
-            return None
+            if event_type == "turn.completed":
+                turn_usage = data.get("usage")
+                if turn_usage:
+                    self.usage = turn_usage
+                self.done = True
+                return None
 
-        # item events
-        if event_type in ("item.completed", "item.started"):
-            return self._process_item(data.get("item", {}))
+            if event_type in ("item.completed", "item.started"):
+                return self._process_item_locked(data.get("item", {}))
 
-        # error events
-        if "fail" in event_type:
-            detail = data.get("error", {}).get("message", "unknown failure")
-            self.errors.append(f"[codex fail] {detail}")
-            evt = TaskEvent(type="error", text=detail)
-            self._push_event(evt)
-            return evt
-
-        if "error" in event_type:
-            msg = data.get("message", "")
-            if not re.match(r"^Reconnecting\.\.\.\s+\d+/\d+", msg):
-                self.errors.append(f"[codex error] {msg}")
-                evt = TaskEvent(type="error", text=msg)
-                self._push_event(evt)
+            if "fail" in event_type:
+                detail = data.get("error", {}).get("message", "unknown failure")
+                self._bounded_append(
+                    self.errors, f"[codex fail] {detail}", self.MAX_ERRORS
+                )
+                evt = TaskEvent(type="error", text=detail)
+                self._push_event_locked(evt)
                 return evt
+
+            if "error" in event_type:
+                msg = data.get("message", "")
+                if not re.match(r"^Reconnecting\.\.\.\s+\d+/\d+", msg):
+                    self._bounded_append(
+                        self.errors, f"[codex error] {msg}", self.MAX_ERRORS
+                    )
+                    evt = TaskEvent(type="error", text=msg)
+                    self._push_event_locked(evt)
+                    return evt
 
         return None
 
-    def _process_item(self, item: dict) -> Optional[TaskEvent]:
+    def _process_item_locked(self, item: dict) -> Optional[TaskEvent]:
+        """Must be called while holding self._lock."""
         item_type = item.get("type", "")
         evt: Optional[TaskEvent] = None
 
@@ -154,57 +171,58 @@ class StreamProcessor:
             text = item.get("text", "")
             self.agent_messages += text
             evt = TaskEvent(type="text", text=text[:500])
-
         elif item_type == "reasoning":
             thinking = item.get("summary", [])
             text = thinking[0].get("text", "") if thinking else ""
             evt = TaskEvent(type="thinking", text=text[:300])
-
         elif item_type == "command_execution":
             cmd_str = item.get("command", "")
             exit_code = item.get("exit_code")
             evt = TaskEvent(type="command", text=f"{cmd_str} (exit={exit_code})")
-
         elif item_type == "function_call":
             evt = TaskEvent(
                 type="tool_call",
                 tool_name=item.get("name", ""),
                 text=str(item.get("arguments", ""))[:300],
             )
-
         elif item_type == "function_call_output":
             output = item.get("output", "")
             evt = TaskEvent(type="tool_result", text=str(output)[:300])
 
         if evt:
-            self._push_event(evt)
+            self._push_event_locked(evt)
         return evt
 
-    def _push_event(self, evt: TaskEvent) -> None:
+    def _push_event_locked(self, evt: TaskEvent) -> None:
         self._events.append(evt)
         if len(self._events) > self.MAX_RECENT_EVENTS:
             self._events = self._events[-self.MAX_RECENT_EVENTS:]
 
-    def recent_events(self, n: int = 20) -> list[dict]:
-        return [
-            {"type": e.type, "text": e.text, "tool_name": e.tool_name}
-            for e in self._events[-n:]
-        ]
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a consistent cross-field snapshot for readers."""
+        with self._lock:
+            return {
+                "success": bool(self.agent_messages) and self.thread_id is not None,
+                "agent_messages": self.agent_messages,
+                "thread_id": self.thread_id,
+                "all_messages": list(self.all_messages),
+                "errors": list(self.errors),
+                "raw_lines": list(self.raw_lines),
+                "usage": self.usage,
+                "recent_events": [
+                    {"type": e.type, "text": e.text, "tool_name": e.tool_name}
+                    for e in self._events
+                ],
+                "events_count": len(self.all_messages),
+            }
 
     @property
     def success(self) -> bool:
-        return bool(self.agent_messages) and self.thread_id is not None
+        with self._lock:
+            return bool(self.agent_messages) and self.thread_id is not None
 
     def to_result(self) -> Dict[str, Any]:
-        return {
-            "success": self.success,
-            "agent_messages": self.agent_messages,
-            "thread_id": self.thread_id,
-            "all_messages": self.all_messages,
-            "errors": self.errors,
-            "raw_lines": self.raw_lines,
-            "usage": self.usage,
-        }
+        return self.snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +243,37 @@ class _TaskState:
 
 _task_registry: Dict[str, _TaskState] = {}
 _registry_lock = threading.Lock()
+
+
+def _allocate_task_id_locked() -> str:
+    """Generate a unique task ID while holding _registry_lock."""
+    while True:
+        task_id = uuid.uuid4().hex[:12]
+        if task_id not in _task_registry:
+            return task_id
+
+
+def _prune_registry_locked(now: Optional[float] = None) -> None:
+    """Remove expired/overflow tasks while holding _registry_lock."""
+    current = now or time.monotonic()
+    # Remove tasks completed more than TASK_RETENTION_SECONDS ago
+    expired = [
+        tid for tid, s in _task_registry.items()
+        if s.completed_at is not None
+        and current - s.completed_at > TASK_RETENTION_SECONDS
+    ]
+    for tid in expired:
+        _task_registry.pop(tid, None)
+    # If still over limit, evict oldest completed tasks
+    overflow = len(_task_registry) - MAX_TRACKED_TASKS
+    if overflow > 0:
+        finished = sorted(
+            (s.completed_at or current, tid)
+            for tid, s in _task_registry.items()
+            if s.completed_at is not None
+        )
+        for _, tid in finished[:overflow]:
+            _task_registry.pop(tid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +348,6 @@ def run_shell_command(
     output_queue: queue.Queue[str | None] = queue.Queue()
     abort_event = threading.Event()
 
-    def is_turn_completed(line: str) -> bool:
-        try:
-            data = json.loads(line)
-            return data.get("type") == "turn.completed"
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            return False
-
     def read_output() -> None:
         try:
             if process.stdout:
@@ -315,10 +357,9 @@ def run_shell_command(
                     stripped = line.strip()
                     if stripped:
                         output_queue.put(stripped)
-                    if is_turn_completed(stripped):
-                        time.sleep(GRACEFUL_SHUTDOWN_DELAY)
-                        _terminate_process(process, use_new_session)
-                        break
+                    # Don't kill the process on turn.completed — let it exit
+                    # naturally so we don't lose tail events or create spurious
+                    # non-zero exit codes from SIGTERM.
                 process.stdout.close()
         except Exception as exc:
             log.warning("read_output thread error: %s", exc)
@@ -410,7 +451,8 @@ def run_shell_command(
             rc = process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             rc = -1
-    if rc and rc != 0:
+    # Only report unexpected exit codes — skip if we already killed the process
+    if rc and rc != 0 and not timed_out and not cancelled:
         log.warning("codex process exited with code %d", rc)
         yield json.dumps({
             "type": "error",
@@ -714,14 +756,14 @@ async def codex_dispatch(
         skip_git_repo_check=skip_git_repo_check,
     )
 
-    task_id = str(uuid.uuid4())[:8]
-    state = _TaskState(
-        task_id=task_id,
-        prompt_preview=PROMPT[:200],
-        cd=str(cd_path),
-    )
-
     with _registry_lock:
+        _prune_registry_locked()
+        task_id = _allocate_task_id_locked()
+        state = _TaskState(
+            task_id=task_id,
+            prompt_preview=PROMPT[:200],
+            cd=str(cd_path),
+        )
         _task_registry[task_id] = state
 
     async def _run() -> None:
@@ -731,16 +773,23 @@ async def codex_dispatch(
                 stream=state.stream,
                 cancel_event=state.cancel_event,
             )
-            # Don't overwrite if already cancelled by codex_cancel
-            if state.status == "running":
-                state.status = "completed" if state.stream.success else "failed"
+            with _registry_lock:
+                if state.status == "running":
+                    state.status = "completed" if state.stream.success else "failed"
         except Exception as exc:
-            state.stream.errors.append(f"[dispatch error] {exc!r}")
-            if state.status == "running":
-                state.status = "failed"
+            state.stream.process_line(json.dumps({
+                "type": "error",
+                "message": f"[dispatch error] {exc!r}",
+            }))
+            with _registry_lock:
+                if state.status == "running":
+                    state.status = "failed"
         finally:
-            if state.completed_at is None:
-                state.completed_at = time.monotonic()
+            with _registry_lock:
+                if state.completed_at is None:
+                    state.completed_at = time.monotonic()
+                state._asyncio_task = None
+                _prune_registry_locked(state.completed_at)
             log.info("dispatch task %s finished: %s", task_id, state.status)
 
     state._asyncio_task = asyncio.create_task(_run())
@@ -773,9 +822,8 @@ async def codex_status(
 
     if not task_id:
         with _registry_lock:
-            tasks = list(_task_registry.values())
-        return {
-            "tasks": [
+            _prune_registry_locked()
+            tasks = [
                 {
                     "task_id": t.task_id,
                     "status": t.status,
@@ -785,40 +833,40 @@ async def codex_status(
                         (t.completed_at or time.monotonic()) - t.started_at, 1
                     ),
                 }
-                for t in tasks
+                for t in _task_registry.values()
             ]
-        }
+        return {"tasks": tasks}
 
     with _registry_lock:
         state = _task_registry.get(task_id)
+        if not state:
+            return {"success": False, "error": f"Task '{task_id}' not found."}
+        status = state.status
+        started_at = state.started_at
+        completed_at = state.completed_at
 
-    if not state:
-        return {"success": False, "error": f"Task '{task_id}' not found."}
-
-    sp = state.stream
-    elapsed = round((state.completed_at or time.monotonic()) - state.started_at, 1)
+    snap = state.stream.snapshot()
+    elapsed = round((completed_at or time.monotonic()) - started_at, 1)
 
     result: Dict[str, Any] = {
-        "task_id": state.task_id,
-        "status": state.status,
+        "task_id": task_id,
+        "status": status,
         "prompt_preview": state.prompt_preview,
         "cd": state.cd,
         "elapsed_seconds": elapsed,
-        "recent_events": sp.recent_events(20),
-        "errors": sp.errors[-10:] if sp.errors else [],
+        "recent_events": snap["recent_events"][-20:],
+        "errors": snap["errors"][-10:] if snap["errors"] else [],
     }
 
-    if state.status != "running":
-        result["agent_messages"] = sp.agent_messages
-        result["SESSION_ID"] = sp.thread_id
-        if sp.usage:
-            result["usage"] = sp.usage
-
+    if status != "running":
+        result["agent_messages"] = snap["agent_messages"]
+        result["SESSION_ID"] = snap["thread_id"]
+        if snap["usage"]:
+            result["usage"] = snap["usage"]
     else:
-        # Show partial progress for running tasks
-        if sp.agent_messages:
-            result["agent_messages_preview"] = sp.agent_messages[-500:]
-        result["events_count"] = len(sp.all_messages)
+        if snap["agent_messages"]:
+            result["agent_messages_preview"] = snap["agent_messages"][-500:]
+        result["events_count"] = snap["events_count"]
 
     return result
 
@@ -837,36 +885,35 @@ async def codex_cancel(
 
     with _registry_lock:
         state = _task_registry.get(task_id)
-
-    if not state:
-        return {"success": False, "error": f"Task '{task_id}' not found."}
-
-    if state.status != "running":
-        return {
-            "success": False,
-            "error": f"Task '{task_id}' is not running (status: {state.status}).",
-        }
-
-    # Signal cancellation — run_shell_command checks this event
-    state.cancel_event.set()
-    state.status = "cancelled"
-    state.completed_at = time.monotonic()
+        if not state:
+            return {"success": False, "error": f"Task '{task_id}' not found."}
+        if state.status != "running":
+            return {
+                "success": False,
+                "error": f"Task '{task_id}' is not running (status: {state.status}).",
+            }
+        state.cancel_event.set()
+        state.status = "cancelled"
+        state.completed_at = time.monotonic()
+        started_at = state.started_at
+        task = state._asyncio_task
 
     # Wait briefly for the asyncio task to finish cleanup
-    if state._asyncio_task and not state._asyncio_task.done():
+    if task and not task.done():
         try:
-            await asyncio.wait_for(asyncio.shield(state._asyncio_task), timeout=5)
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
 
-    elapsed = round(state.completed_at - state.started_at, 1)
+    snap = state.stream.snapshot()
+    elapsed = round((state.completed_at or time.monotonic()) - started_at, 1)
     log.info("task %s cancelled after %.1fs", task_id, elapsed)
 
     return {
         "task_id": task_id,
         "status": "cancelled",
         "elapsed_seconds": elapsed,
-        "partial_agent_messages": state.stream.agent_messages[:500] if state.stream.agent_messages else "",
+        "partial_agent_messages": snap["agent_messages"][-500:] if snap["agent_messages"] else "",
     }
 
 
